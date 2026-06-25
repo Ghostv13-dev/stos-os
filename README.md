@@ -1,337 +1,184 @@
-mkdir -p stos-os/src/engines
-cd stos-os
+STOS V2.3.1
+Telegram Bot Orchestration System — Deno KV is the sole authority. Telegram is a derived side effect.
+Architecture: Four-Zone Pipeline
+INTENT → PLAN → COMMIT → OUTBOX → QUEUE → WORKER → SEND → FINALIZE
+Every Telegram interaction executes through a strict, ordered pipeline. The forbidden path (SEND → COMMIT) is structurally impossible by design.
+Zone Map
+Zone A — Intent Processing (zones/a_intent.ts)
+Step
+Name
+Description
+1
+Webhook Ingress
+Deno.serve() receives Telegram updates
+2
+Global Idempotency Gate
+SHA256(update_id + token) — duplicate updates are dropped
+3
+Identity Resolution
+Classifies sender as OWNER, PUBLIC, or GROUP
+4
+FSM Context Load
+Reads ["owner","state"] and ["public","catalog",chatId,"state"] from KV
+5
+UBES Intent Compiler
+text → IR → route: classifies as READ, ACTION, ANALYZE, or CREATE
+6
+Planner
+Runs permission checks, route selection, and builds ExecutionPlan with MutationFrame[] + OutboxJob[]
+Zone B — Transaction Authority (zones/b_transaction.ts)
+Step
+Name
+Description
+7
+Transaction Frame Assembly
+Assembles Primary Records, Secondary Indexes, Audit Logs, Aggregates, Outbox Jobs, Effect Reservations
+8
+Atomic CAS Transaction
+kv.atomic().check().set(state).set(indexes).set(audit).set(aggregate).set(outbox).enqueue(job).commit()
+On COMMIT SUCCESS: state is durable, outbox created, aggregate created, jobs created.
+On COMMIT FAIL: ABORTED — zero side effects emitted, retried up to 3×.
+Zone C — Transactional Outbox (zones/c_outbox.ts)
+Step
+Name
+Description
+9
+Deno KV Queue
+kv.enqueue() — jobs are durable before any delivery attempt
+10
+Worker Pool
+kv.listenQueue() — concurrent job consumers
+11
+Admission Control
+in_flight < max_inflight (8) — exponential requeue if over limit
+12
+Ownership Lock
+CAS PENDING → RUNNING — prevents duplicate processing across workers
+13
+Effect Dedupe
+HMAC(txId, postId:targetId) sentinel — already-sent effects are skipped
+14
+Global Rate Limiter
+Token bucket: 22 messages / second
+15
+Telegram Delivery
+sendMessage / editMessageText / deleteMessage
+Zone D — Finalization (zones/d_finalize.ts)
+Step
+Name
+Description
+16
+Result Commit
+Writes effects/*, jobs/*, counters atomically
+17
+Delivery Aggregate
+success + failed == expected? → Aggregate Finalizer → PUBLISHED or FAILED
+Invariants
+Authoritative Ordering Guarantee
+INTENT → PLAN → COMMIT → OUTBOX → QUEUE → WORKER → SEND → FINALIZE
+Forbidden Path
+SEND → COMMIT   ← structurally impossible
+Forbidden State Transition
+SCHEDULED → PUBLISHED   ← must pass through CONFIRMING
+File Structure
+stos/
+├── main.ts                  # Entry: Deno.serve() + kv.listenQueue()
+├── deno.json                # Tasks, compiler options
+├── .env.example             # Required environment variables
+│
+├── types.ts                 # All shared type definitions
+│
+├── kv/
+│   ├── store.ts             # Deno.openKv() wrapper
+│   └── keys.ts              # All KV key builders (never construct raw arrays elsewhere)
+│
+├── zones/
+│   ├── a_intent.ts          # Zone A: Steps 1–6
+│   ├── b_transaction.ts     # Zone B: Steps 7–8
+│   ├── c_outbox.ts          # Zone C: Steps 9–15
+│   └── d_finalize.ts        # Zone D: Steps 16–17
+│
+└── lib/
+    ├── crypto.ts             # SHA-256 (idempotency) + HMAC (effect dedupe)
+    ├── identity.ts           # OWNER / PUBLIC / GROUP resolution
+    ├── fsm.ts                # FSM state loader + transition table
+    ├── ubes.ts               # UBES Intent Compiler (text → IR)
+    ├── planner.ts            # Route selection + ExecutionPlan assembly
+    └── telegram.ts           # Telegram API calls (side effects only)
+Quick Start
+1. Configure environment
+cp .env.example .env
+# Fill in BOT_TOKEN, OWNER_ID, CHANNEL_ID, HMAC_SECRET
+2. Set webhook
+curl "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook?url=https://your-host/webhook"
+3. Run
+deno task start
+4. Development (watch mode)
+deno task dev
+KV Key Schema
+Key
+Description
+["idempotency", hash]
+Global update dedup (TTL: 48h)
+["owner", "state"]
+Owner FSM state
+["public", "catalog", chatId, "state"]
+Per-chat public FSM state
+["outbox", "jobs", txId, jobIdx]
+Outbox job record
+["jobs", txId, jobIdx, "status"]
+Job delivery status
+["effects", hmac]
+Effect dedupe sentinel (TTL: 7d)
+["aggregates", txId]
+Delivery aggregate
+["audit", txId, ts]
+Immutable audit log entry
+["rate_limiter", "global"]
+Token bucket state
+["locks", txId, jobIdx]
+Per-job ownership lock
+Identity Roles
+Role
+Condition
+Permissions
+OWNER
+userId == OWNER_ID
+All commands
+GROUP
+Chat type is group or supergroup
+READ, ACTION (subscribe)
+PUBLIC
+All other private chats
+READ, subscribe
+UBES Intent Types
+Type
+Triggers
+READ
+/start, /help, /list, /view, /status
+ACTION
+/cancel, /delete, /publish, /confirm, /subscribe
+ANALYZE
+/stats, /analytics, /report
+CREATE
+/compose, /schedule, /draft, /preview
+Owner FSM States
+IDLE
+ ├─ /compose  → COMPOSING
+ └─ /schedule → SCHEDULING
 
-# 1. Project Config
-cat << 'EOF' > deno.json
-{
-  "tasks": {
-    "start": "deno run --allow-net --allow-env --unstable-kv main.ts"
-  }
-}
-EOF
+COMPOSING
+ ├─ /preview → CONFIRMING
+ └─ /cancel  → IDLE
 
-# 2. Environment Variables
-cat << 'EOF' > src/config.ts
-export const CONFIG = {
-  BOT_TOKEN: Deno.env.get("TELEGRAM_BOT_TOKEN") || "YOUR_TOKEN",
-  API_URL: `https://api.telegram.org/bot${Deno.env.get("TELEGRAM_BOT_TOKEN")}`,
-  OWNER_ID: Number(Deno.env.get("OWNER_TELEGRAM_ID") || "0"),
-  WEBHOOK_SECRET: Deno.env.get("WEBHOOK_SECRET") || "stos_secure_gateway",
-};
-EOF
+SCHEDULING
+ ├─ /confirm → CONFIRMING  ← ONLY valid path to CONFIRMING from SCHEDULING
+ └─ /cancel  → IDLE
 
-# 3. Global Types & FSM States
-cat << 'EOF' > src/types.ts
-export interface TelegramUpdate {
-  update_id: number;
-  message?: any;
-  callback_query?: any;
-  chat_join_request?: any;
-}
+CONFIRMING
+ ├─ /publish → PUBLISHING
+ └─ /cancel  → IDLE
 
-export type UserState = "IDLE" | "BROWSING_FAQ" | "AWAITING_SUPPORT_INPUT" | "TICKET_OPEN" | "ADMIN_COMPOSING_POST" | "ADMIN_TICKET_REPLY";
-export type TicketState = "OPEN" | "PENDING" | "WAITING_USER" | "RESOLVED" | "CLOSED";
-export type PostState = "DRAFT" | "PREVIEW" | "SCHEDULED" | "PUBLISHED" | "ARCHIVED";
-
-export interface UserSession {
-  userId: number;
-  chatId: number;
-  state: UserState;
-  role: "OWNER" | "MEMBER" | "GUEST";
-  currentTicketId?: string;
-  currentDraftId?: string;
-  history: string[];
-}
-
-export interface SupportTicket {
-  ticketId: string;
-  userId: number;
-  state: TicketState;
-  messages: Array<{ sender: "user" | "owner"; text: string; timestamp: number }>;
-}
-
-export interface ContentPost {
-  postId: string;
-  state: PostState;
-  text: string;
-  scheduledFor?: number;
-}
-
-export interface OutboundPayload {
-  chat_id: number | string;
-  method: string;
-  body: Record<string, any>;
-  retryCount: number;
-}
-EOF
-
-# 4. Atomic Database & Ledger (Matrix 5)
-cat << 'EOF' > src/db.ts
-import { UserSession, SupportTicket, OutboundPayload, ContentPost } from "./types.ts";
-
-export const kv = await Deno.openKv();
-
-export interface AtomicCommitPayload {
-  updateId: number;
-  session?: UserSession;
-  ticket?: SupportTicket;
-  post?: ContentPost;
-  outbox?: OutboundPayload[];
-  auditLog?: { action: string; actor: number; timestamp: number };
-}
-
-export async function commitAtomic(userId: number, payload: AtomicCommitPayload): Promise<boolean> {
-  const idempotencyKey = ["idempotency", payload.updateId];
-  
-  let transaction = kv.atomic()
-    .check({ key: idempotencyKey, versionstamp: null })
-    .set(idempotencyKey, true, { expireIn: 86400 * 1000 }); 
-
-  if (payload.session) transaction = transaction.set(["users", userId, "state"], payload.session);
-  if (payload.ticket) transaction = transaction.set(["tickets", payload.ticket.ticketId], payload.ticket);
-  if (payload.post) transaction = transaction.set(["posts", payload.post.state.toLowerCase(), payload.post.postId], payload.post);
-  
-  if (payload.auditLog) {
-    transaction = transaction.set(["audit", crypto.randomUUID()], payload.auditLog);
-  }
-
-  if (payload.outbox) {
-    for (const msg of payload.outbox) {
-      transaction = transaction.set(["outbox", crypto.randomUUID()], msg);
-      transaction = transaction.enqueue(msg);
-    }
-  }
-
-  const result = await transaction.commit();
-  return result.ok;
-}
-EOF
-
-# 5. Button Engine (Matrix 1)
-cat << 'EOF' > src/engines/button.ts
-export function buildInlineMenu(buttons: Array<Array<{text: string, callback_data?: string, url?: string}>>) {
-  return { inline_keyboard: buttons };
-}
-EOF
-
-# 6. Content Engine (Matrix 1 & 8)
-cat << 'EOF' > src/engines/content.ts
-import { UserSession, TelegramUpdate, ContentPost } from "../types.ts";
-import { AtomicCommitPayload } from "../db.ts";
-import { buildInlineMenu } from "./button.ts";
-
-export function processContentFSM(update: TelegramUpdate, session: UserSession, commitPack: AtomicCommitPayload) {
-  const text = update.message?.text;
-  
-  if (session.state === "ADMIN_COMPOSING_POST" && text) {
-    const post: ContentPost = {
-      postId: crypto.randomUUID(),
-      state: "DRAFT",
-      text: text
-    };
-    
-    commitPack.post = post;
-    commitPack.session = { ...session, state: "IDLE" };
-    commitPack.outbox?.push({
-      chat_id: session.chatId,
-      method: "sendMessage",
-      body: {
-        text: `✅ Draft Saved:\n\n${text}`,
-        reply_markup: buildInlineMenu([
-          [{ text: "🚀 Publish", callback_data: `pub_${post.postId}` }, { text: "⏰ Schedule", callback_data: `sch_${post.postId}` }]
-        ])
-      },
-      retryCount: 0
-    });
-  }
-}
-EOF
-
-# 7. Automation Engine (Matrix 2)
-cat << 'EOF' > src/engines/automation.ts
-import { kv } from "../db.ts";
-import { ContentPost } from "../types.ts";
-
-export function startScheduler() {
-  setInterval(async () => {
-    const now = Date.now();
-    const scheduled = kv.list({ prefix: ["posts", "scheduled"] });
-
-    for await (const entry of scheduled) {
-      const post = entry.value as ContentPost;
-      if (post.scheduledFor && post.scheduledFor <= now) {
-        const payload = { chat_id: "@YourBroadcastChannel", method: "sendMessage", body: { text: post.text }, retryCount: 0 };
-        
-        await kv.atomic()
-          .delete(entry.key)
-          .set(["posts", "published", post.postId], { ...post, state: "PUBLISHED" })
-          .enqueue(payload)
-          .commit();
-      }
-    }
-  }, 60000);
-}
-EOF
-
-# 8. Community Engine (Matrix 3)
-cat << 'EOF' > src/engines/community.ts
-import { TelegramUpdate, UserSession } from "../types.ts";
-import { AtomicCommitPayload } from "../db.ts";
-import { buildInlineMenu } from "./button.ts";
-
-export function processCommunityFSM(update: TelegramUpdate, commitPack: AtomicCommitPayload) {
-  if (update.chat_join_request) {
-    commitPack.outbox?.push({
-      chat_id: update.chat_join_request.chat.id,
-      method: "approveChatJoinRequest",
-      body: { user_id: update.chat_join_request.from.id },
-      retryCount: 0
-    });
-    
-    commitPack.outbox?.push({
-      chat_id: update.chat_join_request.from.id,
-      method: "sendMessage",
-      body: { 
-        text: "👋 Welcome! Please read our rules.",
-        reply_markup: buildInlineMenu([[{ text: "📜 Read Rules", callback_data: "view_rules" }]])
-      },
-      retryCount: 0
-    });
-  }
-}
-EOF
-
-# 9. Customer Service Engine (Matrix 4 & 7)
-cat << 'EOF' > src/engines/support.ts
-import { TelegramUpdate, UserSession, SupportTicket } from "../types.ts";
-import { AtomicCommitPayload, kv } from "../db.ts";
-import { CONFIG } from "../config.ts";
-
-export function processSupportFSM(update: TelegramUpdate, session: UserSession, commitPack: AtomicCommitPayload) {
-  const text = update.message?.text;
-  
-  if (session.state === "AWAITING_SUPPORT_INPUT" && text) {
-    const ticketId = crypto.randomUUID();
-    const ticket: SupportTicket = {
-      ticketId, userId: session.userId, state: "OPEN",
-      messages: [{ sender: "user", text, timestamp: Date.now() }]
-    };
-
-    commitPack.ticket = ticket;
-    commitPack.session = { ...session, state: "TICKET_OPEN", currentTicketId: ticketId };
-    
-    // Alert User
-    commitPack.outbox?.push({
-      chat_id: session.chatId, method: "sendMessage", body: { text: `✅ Ticket #${ticketId.slice(0,8)} opened.` }, retryCount: 0
-    });
-    
-    // Alert Owner
-    commitPack.outbox?.push({
-      chat_id: CONFIG.OWNER_ID, method: "sendMessage", body: { text: `🚨 New Ticket from ${session.userId}:\n\n${text}` }, retryCount: 0
-    });
-  }
-}
-EOF
-
-# 10. Control Panel Engine (Matrix 1 & 9)
-cat << 'EOF' > src/engines/control_panel.ts
-import { TelegramUpdate, UserSession } from "../types.ts";
-import { AtomicCommitPayload } from "../db.ts";
-import { buildInlineMenu } from "./button.ts";
-
-export function processControlPanel(update: TelegramUpdate, session: UserSession, commitPack: AtomicCommitPayload) {
-  const cb = update.callback_query?.data;
-  
-  if (cb === "admin_new_post") {
-    commitPack.session = { ...session, state: "ADMIN_COMPOSING_POST" };
-    commitPack.outbox?.push({
-      chat_id: session.chatId, method: "sendMessage", body: { text: "Send the text for the new post:" }, retryCount: 0
-    });
-  }
-}
-EOF
-
-# 11. Delivery Engine (Matrix 5)
-cat << 'EOF' > src/engines/delivery.ts
-import { kv } from "../db.ts";
-import { OutboundPayload } from "../types.ts";
-import { CONFIG } from "../config.ts";
-
-export function startDeliveryWorker() {
-  kv.listenQueue(async (msg: unknown) => {
-    const payload = msg as OutboundPayload;
-    try {
-      const res = await fetch(`${CONFIG.API_URL}/${payload.method}`, {
-        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload.body)
-      });
-      if (!res.ok) throw new Error(await res.text());
-    } catch (e) {
-      if (payload.retryCount < 3) {
-        payload.retryCount++;
-        await kv.enqueue(payload, { delay: Math.pow(2, payload.retryCount) * 1000 });
-      }
-    }
-  });
-}
-EOF
-
-# 12. Main Pipeline Routing
-cat << 'EOF' > src/pipeline.ts
-import { TelegramUpdate, UserSession } from "./types.ts";
-import { commitAtomic, AtomicCommitPayload, kv } from "./db.ts";
-import { CONFIG } from "./config.ts";
-import { processContentFSM } from "./engines/content.ts";
-import { processSupportFSM } from "./engines/support.ts";
-import { processCommunityFSM } from "./engines/community.ts";
-import { processControlPanel } from "./engines/control_panel.ts";
-
-export async function processUpdate(update: TelegramUpdate) {
-  const actor = update.message?.from || update.callback_query?.from || update.chat_join_request?.from;
-  if (!actor) return;
-
-  const sessionDoc = await kv.get<UserSession>(["users", actor.id, "state"]);
-  const isOwner = actor.id === CONFIG.OWNER_ID;
-  
-  const session: UserSession = sessionDoc.value || {
-    userId: actor.id, chatId: actor.id, state: "IDLE", role: isOwner ? "OWNER" : "GUEST", history: []
-  };
-
-  const commitPack: AtomicCommitPayload = { updateId: update.update_id, outbox: [] };
-
-  if (isOwner) {
-    processControlPanel(update, session, commitPack);
-    processContentFSM(update, session, commitPack);
-  } else {
-    processCommunityFSM(update, commitPack);
-    processSupportFSM(update, session, commitPack);
-  }
-
-  if (!commitPack.session) commitPack.session = session;
-  await commitAtomic(actor.id, commitPack);
-}
-EOF
-
-# 13. Webhook Entrypoint
-cat << 'EOF' > main.ts
-import { processUpdate } from "./src/pipeline.ts";
-import { startDeliveryWorker } from "./src/engines/delivery.ts";
-import { startScheduler } from "./src/engines/automation.ts";
-import { CONFIG } from "./src/config.ts";
-
-startDeliveryWorker();
-startScheduler();
-
-Deno.serve({ port: 8080 }, async (req: Request) => {
-  if (req.method === "POST" && req.url.includes(CONFIG.WEBHOOK_SECRET)) {
-    try {
-      await processUpdate(await req.json());
-    } catch (e) {
-      console.error(e);
-    }
-    return new Response("OK", { status: 200 });
-  }
-  return new Response("Unauthorized", { status: 403 });
-});
-EOF
-
-echo "✅ STOS V2.3.2 Full Operating System generated successfully."
+PUBLISHING
+ └─ __done   → IDLE
+Forbidden: SCHEDULING → PUBLISHING (must pass through CONFIRMING)
