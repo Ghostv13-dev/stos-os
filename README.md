@@ -1,184 +1,214 @@
-STOS V2.3.1
-Telegram Bot Orchestration System — Deno KV is the sole authority. Telegram is a derived side effect.
-Architecture: Four-Zone Pipeline
-INTENT → PLAN → COMMIT → OUTBOX → QUEUE → WORKER → SEND → FINALIZE
-Every Telegram interaction executes through a strict, ordered pipeline. The forbidden path (SEND → COMMIT) is structurally impossible by design.
-Zone Map
-Zone A — Intent Processing (zones/a_intent.ts)
-Step
-Name
-Description
-1
-Webhook Ingress
-Deno.serve() receives Telegram updates
-2
-Global Idempotency Gate
-SHA256(update_id + token) — duplicate updates are dropped
-3
-Identity Resolution
-Classifies sender as OWNER, PUBLIC, or GROUP
-4
-FSM Context Load
-Reads ["owner","state"] and ["public","catalog",chatId,"state"] from KV
-5
-UBES Intent Compiler
-text → IR → route: classifies as READ, ACTION, ANALYZE, or CREATE
-6
-Planner
-Runs permission checks, route selection, and builds ExecutionPlan with MutationFrame[] + OutboxJob[]
-Zone B — Transaction Authority (zones/b_transaction.ts)
-Step
-Name
-Description
-7
-Transaction Frame Assembly
-Assembles Primary Records, Secondary Indexes, Audit Logs, Aggregates, Outbox Jobs, Effect Reservations
-8
-Atomic CAS Transaction
-kv.atomic().check().set(state).set(indexes).set(audit).set(aggregate).set(outbox).enqueue(job).commit()
-On COMMIT SUCCESS: state is durable, outbox created, aggregate created, jobs created.
-On COMMIT FAIL: ABORTED — zero side effects emitted, retried up to 3×.
-Zone C — Transactional Outbox (zones/c_outbox.ts)
-Step
-Name
-Description
-9
-Deno KV Queue
-kv.enqueue() — jobs are durable before any delivery attempt
-10
-Worker Pool
-kv.listenQueue() — concurrent job consumers
-11
-Admission Control
-in_flight < max_inflight (8) — exponential requeue if over limit
-12
-Ownership Lock
-CAS PENDING → RUNNING — prevents duplicate processing across workers
-13
-Effect Dedupe
-HMAC(txId, postId:targetId) sentinel — already-sent effects are skipped
-14
-Global Rate Limiter
-Token bucket: 22 messages / second
-15
-Telegram Delivery
-sendMessage / editMessageText / deleteMessage
-Zone D — Finalization (zones/d_finalize.ts)
-Step
-Name
-Description
-16
-Result Commit
-Writes effects/*, jobs/*, counters atomically
-17
-Delivery Aggregate
-success + failed == expected? → Aggregate Finalizer → PUBLISHED or FAILED
-Invariants
-Authoritative Ordering Guarantee
-INTENT → PLAN → COMMIT → OUTBOX → QUEUE → WORKER → SEND → FINALIZE
-Forbidden Path
-SEND → COMMIT   ← structurally impossible
-Forbidden State Transition
-SCHEDULED → PUBLISHED   ← must pass through CONFIRMING
-File Structure
+# STOS V2.3.2 — Production Hardened
+
+**SWAN Telegram Operating System** — One owner. One bot. Buttons replace typing.
+
+This is a **hardened fork** addressing four critical production issues:
+1. **Broadcast Bomb** — Batch fan-out in queue worker, not request path
+2. **OCC Retry Vacuum** — Bounded retries with fresh FSM recomputation
+3. **Table Scan Vacuum** — Paginated, rate-limited reconciliation sweep
+4. **Orphaned Queue State** — Explicit cleanup on success/failure
+
+## Architecture
+
+### Layer 1: Internal Modules (Intent Only)
+Generate execution plans. Never mutate state. Never call each other.
+
+```
+├── Content Engine
+├── Button Engine
+├── Automation Engine
+├── Community Engine
+├── Customer Service Engine
+└── Delivery Engine
+```
+
+### Layer 2: Runtime Services (Validate Intent, Mutate State)
+13-step pipeline with atomic commit, bounded retries, and proper outbox/queue lifecycle.
+
+```
+1.  Event Ingestion
+2.  Identity Resolution
+3.  Permission Validation
+4.  Route Resolution
+5.  Execution Planning
+6.  FSM Processing
+7.  KV Atomic Commit ← all 5 outputs in one transaction
+8.  Outbox Management
+9.  Queue Processing
+10. Delivery Coordination
+11. Audit Recording
+12. Idempotency Control
+13. Lock Management
+
+RETRY LOOP (on OCC failure):
+  - Re-fetch actor from KV
+  - Recompute FSM state
+  - Rebuild commit payload
+  - Retry up to 5 times with exponential backoff
+```
+
+### Layer 3: External Tools (Execute Effects)
+Never mutate STOS state.
+
+```
+├── Telegram Bot API
+├── Deno Runtime / Deno KV
+└── HTTPS Webhook
+```
+
+### Queue Worker (Batched Fan-Out)
+The queue worker implements **batched delivery** for broadcast operations:
+- Reads paginated chunks from KV (max 1000 mutations per commit)
+- Each batch gets its own idempotency marker
+- Prevents broadcast bomb: request path emits single `BROADCAST_JOB`, worker expands it
+
+## Deployment
+
+### 1. Create a Telegram bot
+```bash
+# Message @BotFather
+/newbot
+# Copy the token
+```
+
+### 2. Get your Telegram user ID
+```bash
+# Message @userinfobot
+# Copy your numeric ID
+```
+
+### 3. Deploy to Deno Deploy
+```bash
+# Push to GitHub
+git push origin main
+
+# Go to dash.deno.com → New Project → Import from GitHub
+# Set entry point: main.ts
+# Set environment variables:
+```
+
+**Environment Variables:**
+```bash
+BOT_TOKEN=<your-bot-token>
+WEBHOOK_SECRET=<generate: openssl rand -hex 32>
+OWNER_ID=<your-numeric-user-id>
+WEBHOOK_URL=<your-deno-deploy-url, e.g. https://stos.deno.dev>
+```
+
+### 4. Register the webhook
+```bash
+deno run --allow-env --allow-net scripts/setup-webhook.ts
+```
+
+### 5. Test
+```bash
+# Message your bot
+/start
+# Owner control panel appears
+```
+
+## File Structure
+
+```
 stos/
-├── main.ts                  # Entry: Deno.serve() + kv.listenQueue()
-├── deno.json                # Tasks, compiler options
-├── .env.example             # Required environment variables
-│
-├── types.ts                 # All shared type definitions
-│
-├── kv/
-│   ├── store.ts             # Deno.openKv() wrapper
-│   └── keys.ts              # All KV key builders (never construct raw arrays elsewhere)
-│
-├── zones/
-│   ├── a_intent.ts          # Zone A: Steps 1–6
-│   ├── b_transaction.ts     # Zone B: Steps 7–8
-│   ├── c_outbox.ts          # Zone C: Steps 9–15
-│   └── d_finalize.ts        # Zone D: Steps 16–17
-│
-└── lib/
-    ├── crypto.ts             # SHA-256 (idempotency) + HMAC (effect dedupe)
-    ├── identity.ts           # OWNER / PUBLIC / GROUP resolution
-    ├── fsm.ts                # FSM state loader + transition table
-    ├── ubes.ts               # UBES Intent Compiler (text → IR)
-    ├── planner.ts            # Route selection + ExecutionPlan assembly
-    └── telegram.ts           # Telegram API calls (side effects only)
-Quick Start
-1. Configure environment
-cp .env.example .env
-# Fill in BOT_TOKEN, OWNER_ID, CHANNEL_ID, HMAC_SECRET
-2. Set webhook
-curl "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook?url=https://your-host/webhook"
-3. Run
-deno task start
-4. Development (watch mode)
-deno task dev
-KV Key Schema
-Key
-Description
-["idempotency", hash]
-Global update dedup (TTL: 48h)
-["owner", "state"]
-Owner FSM state
-["public", "catalog", chatId, "state"]
-Per-chat public FSM state
-["outbox", "jobs", txId, jobIdx]
-Outbox job record
-["jobs", txId, jobIdx, "status"]
-Job delivery status
-["effects", hmac]
-Effect dedupe sentinel (TTL: 7d)
-["aggregates", txId]
-Delivery aggregate
-["audit", txId, ts]
-Immutable audit log entry
-["rate_limiter", "global"]
-Token bucket state
-["locks", txId, jobIdx]
-Per-job ownership lock
-Identity Roles
-Role
-Condition
-Permissions
-OWNER
-userId == OWNER_ID
-All commands
-GROUP
-Chat type is group or supergroup
-READ, ACTION (subscribe)
-PUBLIC
-All other private chats
-READ, subscribe
-UBES Intent Types
-Type
-Triggers
-READ
-/start, /help, /list, /view, /status
-ACTION
-/cancel, /delete, /publish, /confirm, /subscribe
-ANALYZE
-/stats, /analytics, /report
-CREATE
-/compose, /schedule, /draft, /preview
-Owner FSM States
-IDLE
- ├─ /compose  → COMPOSING
- └─ /schedule → SCHEDULING
+├── main.ts ← Server entry point, webhook + queue worker
+├── deno.json ← Project config + tasks
+├── .env.example ← Environment variables
+├── scripts/
+│   └── setup-webhook.ts ← One-time webhook registration
+└── src/
+    ├── types/
+    │   └── index.ts ← All types and interfaces
+    ├── engines/ ← Layer 1: Intent generation
+    │   ├── button-engine.ts
+    │   ├── content-engine.ts
+    │   ├── automation-engine.ts
+    │   ├── community-engine.ts
+    │   ├── customer-service-engine.ts
+    │   └── delivery-engine.ts
+    ├── runtime/ ← Layer 2: State mutation + pipeline
+    │   ├── pipeline.ts ← 13-step processing + retry loop
+    │   ├── router.ts ← Step 4: Route resolution
+    │   ├── kv.ts ← Deno KV access + atomic commit
+    │   ├── delivery.ts ← Step 10: Delivery coordination
+    │   └── queue-worker.ts ← Batched queue consumption
+    └── utils/
+        └── telegram.ts ← Layer 3: Telegram API wrapper
+```
 
-COMPOSING
- ├─ /preview → CONFIRMING
- └─ /cancel  → IDLE
+## Key Fixes
 
-SCHEDULING
- ├─ /confirm → CONFIRMING  ← ONLY valid path to CONFIRMING from SCHEDULING
- └─ /cancel  → IDLE
+### Fix #1: Broadcast Bomb
+**Problem:** `planToOutboxEntries()` in synchronous request path scales outbox entries linearly with audience size.
 
-CONFIRMING
- ├─ /publish → PUBLISHING
- └─ /cancel  → IDLE
+**Solution:** 
+- Layer 1 emits single `BROADCAST_JOB` intent with subscriber list or cursor
+- Queue worker reads KV in paginated batches (≤1000 per commit)
+- Each batch gets idempotency marker to prevent double-send on worker crash
 
-PUBLISHING
- └─ __done   → IDLE
-Forbidden: SCHEDULING → PUBLISHING (must pass through CONFIRMING)
+**Files:**
+- `src/engines/delivery-engine.ts` — Changed to emit `BROADCAST_JOB` instead of individual outbox entries
+- `src/runtime/queue-worker.ts` — New batched delivery logic with pagination
+
+### Fix #2: OCC Retry Vacuum
+**Problem:** Single concurrent write silently drops update because `atomicCommit()` returns false and throws immediately. No retry, but INV-09 still forces 200 back to Telegram.
+
+**Solution:**
+- Bounded retry loop (5 attempts, exponential backoff)
+- Re-fetch actor from KV on each retry
+- Recompute FSM state against freshly-fetched actor
+- Only throw after all retries exhausted
+
+**Files:**
+- `src/runtime/pipeline.ts` — Wrapped commit in `retryWithBackoff()` loop
+
+### Fix #3: Table Scan Vacuum
+**Problem:** `listPendingOutbox()` does O(N) scan on every check. No pagination, no rate-limiting.
+
+**Solution:**
+- Reconciliation sweep is still needed (for entries whose enqueue failed or worker crashed before ack)
+- But only run via background cron job, not per-request
+- Use cursor-based pagination to scan in chunks
+- Rate-limit sweep interval to once per minute
+
+**Files:**
+- `src/runtime/kv.ts` — `listPendingOutbox()` now uses pagination cursor
+- `src/runtime/queue-worker.ts` — Reconciliation sweep scheduled at interval, not on-demand
+
+### Fix #4: Orphaned Queue State
+**Problem:** `tx.enqueue()` creates durable job, but `Keys.queue(item.id)` write orphans it if worker never runs or crashes before ack.
+
+**Solution:**
+- Remove `Keys.queue(item.id)` write entirely and rely on `tx.enqueue()` payload
+- OR keep it but explicitly `kv.delete()` on successful processing
+- For failed jobs, write to dead-letter queue before delete
+
+**Files:**
+- `src/runtime/kv.ts` — `atomicCommit()` no longer writes queue state keys
+- `src/runtime/queue-worker.ts` — Explicit cleanup on success/failure
+
+## Invariants (Never Violate)
+
+| # | Rule |
+|---|------|
+| INV-01 | All mutations commit in one atomic transaction |
+| INV-02 | Internal Modules produce intent only. Never side effects |
+| INV-03 | Only Runtime Services may mutate persistent state |
+| INV-04 | Outbox entries written inside the atomic commit |
+| INV-05 | Idempotency check occurs before execution begins |
+| INV-06 | Lock acquired before FSM processing begins |
+| INV-07 | Audit entries are permanent and immutable |
+| INV-08 | STOS has exactly one owner. Always singular |
+| INV-09 | Webhook always returns 200 to Telegram |
+| INV-10 | Secret token validated on every incoming request |
+| INV-11 | Modules do not share state or call each other |
+| INV-12 | Pipeline steps execute in fixed sequential order |
+| INV-13 | Telegram is an output surface only. Never drives FSM directly |
+
+## Security
+
+- **Secret token:** Validated on every request before any processing
+- **Environment variables:** BOT_TOKEN and WEBHOOK_SECRET live only in Deno Deploy env vars—never in source code, logs, or responses
+- **Three roles:** OWNER / MEMBER / GUEST
+- **KV namespaces:** Isolated by key prefix, never by if-checks
+- **Divergence rule:** If code diverges from the specification, the code is wrong
